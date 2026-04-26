@@ -1,0 +1,6 @@
+.claude*
+app.log
+*.bak
+__pycache__/
+*.pyc
+.env

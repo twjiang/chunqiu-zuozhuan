@@ -3,9 +3,9 @@
 
 import json
 import os
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, render_template_string, request, jsonify, redirect, url_for
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static'))
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Load data
@@ -17,6 +17,32 @@ DUKES = DATA['dukes']
 YEARS = DATA['years']
 STATE_INDEX = DATA['state_index']
 STATE_LIST = DATA['state_list']
+
+# Build inverted index for fast substring search
+# Maps each 2-char bigram to set of record indices
+BIGRAM_INDEX = {}
+for _i, _r in enumerate(RECORDS):
+    _text = _r['text']
+    for _j in range(len(_text) - 1):
+        _bg = _text[_j:_j+2]
+        if _bg not in BIGRAM_INDEX:
+            BIGRAM_INDEX[_bg] = []
+        BIGRAM_INDEX[_bg].append(_i)
+# Also index single chars for short queries
+CHAR_INDEX = {}
+for _i, _r in enumerate(RECORDS):
+    for _c in set(_r['text']):
+        if _c not in CHAR_INDEX:
+            CHAR_INDEX[_c] = []
+        CHAR_INDEX[_c].append(_i)
+
+# Build duke+year index for O(1) year lookups
+YEAR_INDEX = {}
+for _i, _r in enumerate(RECORDS):
+    _key = (_r['duke'], _r['year_num'])
+    if _key not in YEAR_INDEX:
+        YEAR_INDEX[_key] = []
+    YEAR_INDEX[_key].append(_i)
 
 # Load person aliases
 ALIASES = {}
@@ -35,10 +61,41 @@ if os.path.exists(_alias_path):
         ALIASES[canonical] = sorted(all_names)
 
 
+def save_aliases():
+    """Save aliases to JSON file."""
+    with open(_alias_path, 'w', encoding='utf-8') as f:
+        json.dump(ALIASES, f, ensure_ascii=False, indent=2)
+
+
+def load_aliases():
+    """Reload aliases from JSON file."""
+    global ALIASES, ALIAS_LOOKUP
+    ALIASES = {}
+    ALIAS_LOOKUP = {}
+    if os.path.exists(_alias_path):
+        with open(_alias_path, 'r', encoding='utf-8') as f:
+            _raw = json.load(f)
+        for _canonical, _aliases in _raw.items():
+            _all = set(_aliases)
+            _all.add(_canonical)
+            ALIASES[_canonical] = sorted(_all)
+            for _n in _all:
+                if _n not in ALIAS_LOOKUP:
+                    ALIAS_LOOKUP[_n] = _canonical
+
+
 def find_alias_groups(name):
-    """Find all alias groups that match the given name (exact or substring)."""
+    """Find alias groups for the given name.
+    
+    Strategy:
+    1. Exact match in ALIAS_LOOKUP (covers canonical names and full aliases)
+    2. If no exact match, find groups where any alias STARTS WITH the input
+       (e.g. '东门' matches '东门襄仲')
+    But NEVER expand through short shared aliases (no multi-hop).
+    """
     matched_groups = []
     seen_keys = set()
+    
     # 1. Exact match
     canonical = ALIAS_LOOKUP.get(name)
     if canonical and canonical in ALIASES:
@@ -46,37 +103,49 @@ def find_alias_groups(name):
         if key not in seen_keys:
             seen_keys.add(key)
             matched_groups.append(ALIASES[canonical])
-    # 2. Substring match: name appears in any alias, or any alias contains name
-    #    Skip single-char aliases to avoid false matches (e.g. '仲' matching 管仲)
-    for canonical_name, group in ALIASES.items():
-        for alias in group:
-            if len(alias) < 2 and len(name) >= 2:
-                continue
-            if name in alias or (len(name) >= 2 and alias in name):
-                key = '|'.join(sorted(group))
-                if key not in seen_keys:
-                    seen_keys.add(key)
-                    matched_groups.append(group)
-                break
-    # If no match found, just search the name itself
+    
+    # 2. If no exact match, try prefix match on aliases
+    if not matched_groups:
+        for canonical_name, group in ALIASES.items():
+            for alias in group:
+                if alias.startswith(name) or name.startswith(alias):
+                    key = '|'.join(sorted(group))
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        matched_groups.append(group)
+                    break
+    
+    # If still no match, just search the name itself
     if not matched_groups:
         return [[name]]
     return matched_groups
 
 
 def search_by_year(duke_name, year_num):
-    """Search records by duke and year number."""
-    results = []
-    for r in RECORDS:
-        if r['duke'] == duke_name and r['year_num'] == year_num:
-            results.append(r)
-    return results
+    """Search records by duke and year number using index."""
+    indices = YEAR_INDEX.get((duke_name, year_num), [])
+    return [RECORDS[i] for i in indices]
+
+
+def _bigram_search(query):
+    """Find record indices containing query using bigram index."""
+    if len(query) >= 2:
+        candidates = None
+        for j in range(len(query) - 1):
+            bg = query[j:j+2]
+            idx = set(BIGRAM_INDEX.get(bg, []))
+            candidates = idx if candidates is None else (candidates & idx)
+            if not candidates:
+                return set()
+        return {i for i in candidates if query in RECORDS[i]['text']}
+    elif len(query) == 1:
+        return set(CHAR_INDEX.get(query, []))
+    return set()
 
 
 def search_by_person(name):
     """Search records containing a person's name (including all aliases)."""
     groups = find_alias_groups(name)
-    # Merge all names from all matched groups
     all_names = []
     seen = set()
     for group in groups:
@@ -84,31 +153,23 @@ def search_by_person(name):
             if n not in seen:
                 seen.add(n)
                 all_names.append(n)
-    results = []
-    for r in RECORDS:
-        for n in all_names:
-            if n in r['text']:
-                results.append(r)
-                break  # Don't add same record twice
+    matched = set()
+    for n in all_names:
+        matched |= _bigram_search(n)
+    results = [RECORDS[i] for i in sorted(matched)]
     return results, all_names
 
 
 def search_by_state(state_name):
-    """Search records mentioning a state."""
-    results = []
-    for r in RECORDS:
-        if state_name in r['text']:
-            results.append(r)
-    return results
+    """Search records mentioning a state using index."""
+    indices = _bigram_search(state_name)
+    return [RECORDS[i] for i in sorted(indices)]
 
 
 def fulltext_search(query):
-    """Full-text search across all records."""
-    results = []
-    for r in RECORDS:
-        if query in r['text']:
-            results.append(r)
-    return results
+    """Full-text search using bigram index."""
+    indices = _bigram_search(query)
+    return [RECORDS[i] for i in sorted(indices)]
 
 
 HTML_TEMPLATE = '''<!DOCTYPE html>
@@ -117,6 +178,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>春秋左传查询系统</title>
+<link rel="icon" type="image/svg+xml" href="/static/logo.svg">
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
@@ -128,17 +190,17 @@ body {
 .header {
     background: linear-gradient(135deg, #5c3a21, #8b6914);
     color: #f5f0e8;
-    padding: 2rem 1rem;
+    padding: 1.5rem 1rem;
     text-align: center;
 }
-.header h1 {
+.header .title-group h1 {
     font-size: 2rem;
     letter-spacing: 0.3em;
-    margin-bottom: 0.5rem;
+    margin-bottom: 0.3rem;
 }
-.header p {
-    font-size: 0.9rem;
-    opacity: 0.8;
+.header .title-group p {
+    font-size: 0.85rem;
+    opacity: 0.75;
 }
 .container {
     max-width: 1100px;
@@ -251,31 +313,29 @@ body {
 }
 .tag:hover { background: #d4c4a0; }
 .tag .num { color: #8b6914; font-size: 0.75rem; margin-left: 0.2rem; }
-
 .empty { color: #999; text-align: center; padding: 3rem; font-style: italic; }
 @media (max-width: 600px) {
     .container { padding: 0.8rem; }
     .header h1 { font-size: 1.4rem; }
     .tab { padding: 0.5rem 0.8rem; font-size: 0.9rem; }
-
 }
 </style>
 </head>
 <body>
-
 <div class="header">
-    <h1>春秋左传</h1>
-    <p>按年份浏览 · 人物检索 · 国名检索 · 全文搜索</p>
+    <div class="title-group">
+        <h1>春秋左传</h1>
+        <p>按年份浏览 · 人物检索 · 国名检索 · 全文搜索 · 别名管理</p>
+    </div>
 </div>
-
 <div class="container">
     <div class="tabs">
         <div class="tab active" data-tab="year">年份浏览</div>
         <div class="tab" data-tab="person">人物检索</div>
         <div class="tab" data-tab="state">国名检索</div>
         <div class="tab" data-tab="search">全文搜索</div>
+        <div class="tab" data-tab="aliases">别名管理</div>
     </div>
-
     <!-- Year Panel -->
     <div class="panel active" id="panel-year">
         <div class="search-box">
@@ -294,7 +354,6 @@ body {
             <div class="empty">选择年份查看春秋左传原文</div>
         </div>
     </div>
-
     <!-- Person Panel -->
     <div class="panel" id="panel-person">
         <div class="search-box">
@@ -306,7 +365,6 @@ body {
             <div class="empty">输入人物名称检索相关春秋左传原文</div>
         </div>
     </div>
-
     <!-- State Panel -->
     <div class="panel" id="panel-state">
         <div class="tag-cloud" id="state-tags">
@@ -318,7 +376,6 @@ body {
             <div class="empty">点击国名查看相关春秋左传原文</div>
         </div>
     </div>
-
     <!-- Search Panel -->
     <div class="panel" id="panel-search">
         <div class="search-box">
@@ -329,11 +386,17 @@ body {
             <div class="empty">输入关键词搜索春秋左传全文</div>
         </div>
     </div>
+    <div class="panel" id="panel-aliases">
+        <div class="search-box">
+            <input type="text" id="alias-search-input" placeholder="搜索人物名称或别名...">
+            <button onclick="searchAliasMgmt()">搜索</button>
+            <button onclick="showAddAliasModal()">+ 添加别名</button>
+        </div>
+        <div class="results" id="alias-mgmt-list" style="max-height:600px;overflow-y:auto;"></div>
+    </div>
 </div>
-
 <script>
 const dukeYears = {{ duke_years_json|safe }};
-
 // Tab switching
 document.querySelectorAll('.tab').forEach(tab => {
     tab.addEventListener('click', () => {
@@ -343,7 +406,6 @@ document.querySelectorAll('.tab').forEach(tab => {
         document.getElementById('panel-' + tab.dataset.tab).classList.add('active');
     });
 });
-
 // Duke-year dropdown
 document.getElementById('sel-duke').addEventListener('change', function() {
     const duke = this.value;
@@ -358,51 +420,65 @@ document.getElementById('sel-duke').addEventListener('change', function() {
         });
     }
 });
+// Track current query params for pagination
+let currentQuery = {type:'', params:{}};
 
-function queryByYear() {
+function queryByYear(page) {
     const duke = document.getElementById('sel-duke').value;
     const year = document.getElementById('sel-year').value;
     if (!duke || !year) { alert('请选择公和年份'); return; }
-    fetch('/api/query?type=year&duke=' + encodeURIComponent(duke) + '&year=' + year)
+    currentQuery = {type:'year', params:{duke, year}};
+    fetch('/api/query?type=year&duke=' + encodeURIComponent(duke) + '&year=' + year + '&page=' + (page||1))
         .then(r => r.json()).then(renderResults.bind(null, 'year-results'));
 }
-
-function queryByPerson() {
+function queryByPerson(page) {
     const name = document.getElementById('input-person').value.trim();
     if (!name) { alert('请输入人物名称'); return; }
-    fetch('/api/query?type=person&name=' + encodeURIComponent(name))
+    currentQuery = {type:'person', params:{name}};
+    fetch('/api/query?type=person&name=' + encodeURIComponent(name) + '&page=' + (page||1))
         .then(r => r.json()).then(renderResults.bind(null, 'person-results'));
 }
-
-function queryByState(state) {
-    fetch('/api/query?type=state&name=' + encodeURIComponent(state))
+function queryByState(state, page) {
+    currentQuery = {type:'state', params:{name:state}};
+    fetch('/api/query?type=state&name=' + encodeURIComponent(state) + '&page=' + (page||1))
         .then(r => r.json()).then(renderResults.bind(null, 'state-results'));
 }
-
-function fulltextSearch() {
+function fulltextSearch(page) {
     const q = document.getElementById('input-search').value.trim();
     if (!q) { alert('请输入搜索关键词'); return; }
-    fetch('/api/query?type=search&q=' + encodeURIComponent(q))
+    currentQuery = {type:'search', params:{q}};
+    fetch('/api/query?type=search&q=' + encodeURIComponent(q) + '&page=' + (page||1))
         .then(r => r.json()).then(renderResults.bind(null, 'search-results'));
 }
-
+function loadPage(containerId, page) {
+    const q = currentQuery;
+    const p = q.params;
+    if (q.type === 'year') queryByYear(page);
+    else if (q.type === 'person') queryByPerson(page);
+    else if (q.type === 'state') queryByState(p.name, page);
+    else if (q.type === 'search') fulltextSearch(page);
+}
 function renderResults(containerId, data) {
     const container = document.getElementById(containerId);
-    if (!data.results || data.results.length === 0) {
+    if (!data.n || data.n === 0) {
         container.innerHTML = '<div class="empty">未找到相关记录</div>';
         return;
     }
     let aliasInfo = '';
-    if (data.keyword && data.keyword.includes('|')) {
-        const names = data.keyword.split('|');
+    if (data.k && data.k.includes('|')) {
+        const names = data.k.split('|');
         aliasInfo = '<div style="color:#8b6914;font-size:0.9rem;margin-bottom:0.5rem;">关联别名：' + names.map(n => '<span style="background:#ffeaa7;padding:1px 4px;border-radius:2px;margin:0 2px;">' + n + '</span>').join('') + '</div>';
     }
-    let html = aliasInfo + '<div class="count">共找到 ' + data.results.length + ' 条记录</div>';
-    data.results.forEach(r => {
-        let text = escapeHtml(r.text);
-        // Highlight search keyword(s)
-        if (data.keyword) {
-            const kws = data.keyword.split('|');
+    const pages = Math.ceil(data.n / data.ps);
+    let pager = '';
+    if (pages > 1) {
+        pager = '<div style="margin-top:1rem;text-align:center;" class="pager-container" data-ps="' + data.ps + '"></div>';
+    }
+    let html = aliasInfo + '<div class="count">共找到 ' + data.n + ' 条记录' + (data.m ? '（显示第 ' + ((data.p-1)*data.ps+1) + '-' + (data.p*data.ps) + ' 条）' : '') + '</div>';
+    data.r.forEach(r => {
+        let text = escapeHtml(r.t);
+        if (data.k) {
+            const kws = data.k.split('|');
             kws.forEach(kw => {
                 const escaped = escapeHtml(kw);
                 if (escaped) {
@@ -411,25 +487,29 @@ function renderResults(containerId, data) {
                 }
             });
         }
-        const sectionLabel = r.section === 'jing' ? '经' : '传';
+        const sectionLabel = r.s === 'jing' ? '经' : '传';
         html += '<div class="record">'
             + '<div class="meta">'
-            + '<span>' + r.duke + (r.year_num > 0 ? r.year_num + '年' : '') + '</span>'
-            + '<span>前' + r.year_bc + '年</span>'
+            + '<span>' + r.d + (r.y > 0 ? r.y + '年' : '') + '</span>'
+            + '<span>前' + r.b + '年</span>'
             + '<span>' + sectionLabel + '</span>'
             + '</div>'
             + '<div class="text">' + text + '</div>'
             + '</div>';
     });
+    html += pager;
     container.innerHTML = html;
+    // Bind pagination
+    const ps = parseInt(container.querySelector('.pager-container')?.dataset.ps || 50);
+    container.querySelectorAll('.page-btn').forEach(btn => {
+        btn.addEventListener('click', () => loadPage(containerId, parseInt(btn.dataset.page)));
+    });
 }
-
 function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
 }
-
 // Enter key support
 document.getElementById('input-person').addEventListener('keydown', e => { if (e.key === 'Enter') queryByPerson(); });
 // Alias autocomplete for person search
@@ -462,9 +542,116 @@ function selectPerson(name) {
     queryByPerson();
 }
 document.getElementById('input-search').addEventListener('keydown', e => { if (e.key === 'Enter') fulltextSearch(); });
+document.getElementById('alias-search-input').addEventListener('keydown', e => { if (e.key === 'Enter') searchAliasMgmt(); });
+
+// ===== Alias Management Panel =====
+let aliasMgmtCurrentEdit = null;
+
+function loadAliasMgmt(q) {
+    const url = q ? '/api/aliases/list?q=' + encodeURIComponent(q) : '/api/aliases/list';
+    fetch(url).then(r => r.json()).then(data => renderAliasMgmt(data.aliases));
+}
+
+function renderAliasMgmt(aliases) {
+    const c = document.getElementById('alias-mgmt-list');
+    if (!aliases || aliases.length === 0) {
+        c.innerHTML = '<div class="empty">暂无别名数据</div>';
+        return;
+    }
+    let html = '<div class="count">共 ' + aliases.length + ' 条别名</div>';
+    aliases.forEach(item => {
+        const tags = item.aliases.map(a => '<span class="tag">' + escapeHtml(a) + '</span>').join('');
+        html += '<div class="record"><div class="meta"><span style="font-weight:bold;color:#8b6914;">' + escapeHtml(item.canonical) + '</span></div>'
+            + '<div class="tag-cloud">' + tags + '</div>'
+            + '<div style="margin-top:0.3rem;"><button class="alias-mgmt-edit" data-canonical="' + escapeHtml(item.canonical) + '" style="font-size:0.85rem;padding:0.2rem 0.6rem;margin-right:0.3rem;cursor:pointer;background:#e8dcc8;border:none;border-radius:3px;">编辑</button>'
+            + '<button class="alias-mgmt-del" data-canonical="' + escapeHtml(item.canonical) + '" style="font-size:0.85rem;padding:0.2rem 0.6rem;cursor:pointer;background:#fadbd8;color:#c0392b;border:none;border-radius:3px;">删除</button></div></div>';
+    });
+    c.innerHTML = html;
+    c.querySelectorAll('.alias-mgmt-edit').forEach(el => el.addEventListener('click', () => editAliasMgmt(el.dataset.canonical)));
+    c.querySelectorAll('.alias-mgmt-del').forEach(el => el.addEventListener('click', () => deleteAliasMgmt(el.dataset.canonical)));
+}
+
+function searchAliasMgmt() {
+    const q = document.getElementById('alias-search-input').value.trim();
+    loadAliasMgmt(q);
+}
+
+function showAddAliasModal() {
+    aliasMgmtCurrentEdit = null;
+    document.getElementById('alias-modal-title').textContent = '添加别名';
+    document.getElementById('alias-modal-canonical').value = '';
+    document.getElementById('alias-modal-aliases').value = '';
+    document.getElementById('alias-modal').style.display = 'flex';
+}
+
+function editAliasMgmt(canonical) {
+    aliasMgmtCurrentEdit = canonical;
+    document.getElementById('alias-modal-title').textContent = '编辑别名';
+    document.getElementById('alias-modal-canonical').value = canonical;
+    fetch('/api/aliases/list?q=' + encodeURIComponent(canonical))
+        .then(r => r.json()).then(data => {
+            const item = data.aliases.find(a => a.canonical === canonical);
+            if (item) document.getElementById('alias-modal-aliases').value = item.aliases.filter(a => a !== canonical).join(', ');
+        });
+    document.getElementById('alias-modal').style.display = 'flex';
+}
+
+function closeAliasModal() {
+    document.getElementById('alias-modal').style.display = 'none';
+}
+
+function saveAliasMgmt() {
+    const canonical = document.getElementById('alias-modal-canonical').value.trim();
+    const aliasesStr = document.getElementById('alias-modal-aliases').value.trim();
+    if (!canonical) { alert('请输入标准名称'); return; }
+    const aliases = aliasesStr.split(/[,，\s]+/).filter(a => a.trim());
+    const url = aliasMgmtCurrentEdit ? '/api/aliases/update' : '/api/aliases/add';
+    const body = { canonical, aliases };
+    if (aliasMgmtCurrentEdit) body.old_canonical = aliasMgmtCurrentEdit;
+    fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+        .then(r => r.json()).then(data => {
+            if (data.success) { closeAliasModal(); loadAliasMgmt(); }
+            else alert(data.message || '保存失败');
+        });
+}
+
+function deleteAliasMgmt(canonical) {
+    if (!confirm('确定删除「' + canonical + '」的别名？')) return;
+    fetch('/api/aliases/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ canonical }) })
+        .then(r => r.json()).then(data => {
+            if (data.success) loadAliasMgmt();
+            else alert(data.message || '删除失败');
+        });
+}
+
+// Load alias data when switching to the tab
+const origTabHandler = document.querySelectorAll('.tab');
+document.querySelectorAll('.tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+        if (tab.dataset.tab === 'aliases') loadAliasMgmt();
+    });
+});
 </script>
+
+<!-- Alias Edit Modal -->
+<div id="alias-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:1000;justify-content:center;align-items:center;">
+  <div style="background:#fff;border-radius:8px;padding:1.5rem;width:90%;max-width:480px;">
+    <div id="alias-modal-title" style="font-size:1.2rem;font-weight:bold;color:#8b6914;margin-bottom:1rem;">添加别名</div>
+    <label style="display:block;font-weight:bold;margin-bottom:0.3rem;">标准名称（正名）</label>
+    <input id="alias-modal-canonical" type="text" placeholder="如：季孙宿" style="width:100%;padding:0.5rem;border:1px solid #c4b08a;border-radius:4px;font-size:1rem;margin-bottom:1rem;">
+    <label style="display:block;font-weight:bold;margin-bottom:0.3rem;">别名列表（逗号分隔）</label>
+    <input id="alias-modal-aliases" type="text" placeholder="如：季武子, 季武子宿" style="width:100%;padding:0.5rem;border:1px solid #c4b08a;border-radius:4px;font-size:1rem;margin-bottom:1rem;">
+    <div style="display:flex;gap:0.5rem;justify-content:flex-end;">
+      <button onclick="closeAliasModal()" style="padding:0.5rem 1rem;background:#e8dcc8;border:none;border-radius:4px;cursor:pointer;">取消</button>
+      <button onclick="saveAliasMgmt()" style="padding:0.5rem 1rem;background:#8b6914;color:#fff;border:none;border-radius:4px;cursor:pointer;">保存</button>
+    </div>
+  </div>
+</div>
 </body>
 </html>'''
+
+
+ALIAS_MANAGE_TEMPLATE = ""
 
 
 @app.route('/')
@@ -475,7 +662,7 @@ def index():
         HTML_TEMPLATE,
         duke_names=duke_names,
         dukes=DUKES,
-        state_list=STATE_LIST[:50],  # Top 50 states
+        state_list=STATE_LIST[:50],
         state_index=STATE_INDEX,
         duke_years_json=json.dumps(duke_years, ensure_ascii=False),
     )
@@ -484,9 +671,11 @@ def index():
 @app.route('/api/query')
 def api_query():
     qtype = request.args.get('type', '')
+    page = max(1, int(request.args.get('page', '1')))
+    page_size = min(100, max(10, int(request.args.get('size', '50'))))
     results = []
     keyword = ''
-    
+
     if qtype == 'year':
         duke = request.args.get('duke', '')
         year = request.args.get('year', '0')
@@ -508,22 +697,30 @@ def api_query():
         q = request.args.get('q', '')
         results = fulltext_search(q)
         keyword = q
-    
-    # Limit results to prevent huge responses
-    max_results = 500
-    truncated = len(results) > max_results
-    results = results[:max_results]
-    
+
+    total = len(results)
+    start = (page - 1) * page_size
+    end = start + page_size
+    page_results = results[start:end]
+    has_more = end < total
+
+    # Slim down response: only send needed fields
+    slim = [{
+        'd': r['duke'],
+        'y': r['year_num'],
+        'b': r['year_bc'],
+        's': r['section'],
+        't': r['text']
+    } for r in page_results]
+
     return jsonify({
-        'results': results,
-        'keyword': keyword,
-        'total': len(results),
-        'truncated': truncated,
+        'r': slim,
+        'k': keyword,
+        'n': total,
+        'p': page,
+        'ps': page_size,
+        'm': has_more,
     })
-
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=80, debug=False)
 
 
 @app.route('/api/aliases')
@@ -546,3 +743,118 @@ def api_aliases():
                     'aliases': group,
                 })
     return jsonify({'suggestions': suggestions[:20]})
+
+
+# Alias Management Routes
+@app.route('/admin/aliases')
+def admin_aliases():
+    """Redirect to main page with aliases tab."""
+    return redirect('/#aliases')
+
+
+@app.route('/api/aliases/list')
+def api_aliases_list():
+    """Get all aliases, optionally filtered by search query."""
+    q = request.args.get('q', '').strip().lower()
+    result = []
+    for canonical, aliases in ALIASES.items():
+        if q:
+            # Search in canonical name or any alias
+            if q not in canonical.lower() and not any(q in a.lower() for a in aliases):
+                continue
+        result.append({
+            'canonical': canonical,
+            'aliases': aliases
+        })
+    # Sort by canonical name
+    result.sort(key=lambda x: x['canonical'])
+    return jsonify({'aliases': result})
+
+
+@app.route('/api/aliases/add', methods=['POST'])
+def api_aliases_add():
+    """Add a new alias group."""
+    data = request.get_json()
+    canonical = data.get('canonical', '').strip()
+    aliases = data.get('aliases', [])
+    
+    if not canonical:
+        return jsonify({'success': False, 'message': '标准名称不能为空'})
+    
+    if canonical in ALIASES:
+        return jsonify({'success': False, 'message': '该标准名称已存在'})
+    
+    # Add canonical to aliases list
+    all_names = set(aliases)
+    all_names.add(canonical)
+    ALIASES[canonical] = sorted(all_names)
+    
+    # Update lookup
+    for name in all_names:
+        if name not in ALIAS_LOOKUP:
+            ALIAS_LOOKUP[name] = canonical
+    
+    save_aliases()
+    return jsonify({'success': True})
+
+
+@app.route('/api/aliases/update', methods=['POST'])
+def api_aliases_update():
+    """Update an existing alias group."""
+    data = request.get_json()
+    old_canonical = data.get('old_canonical', '').strip()
+    canonical = data.get('canonical', '').strip()
+    aliases = data.get('aliases', [])
+    
+    if not canonical:
+        return jsonify({'success': False, 'message': '标准名称不能为空'})
+    
+    if old_canonical not in ALIASES:
+        return jsonify({'success': False, 'message': '原标准名称不存在'})
+    
+    # Remove old lookup entries
+    old_aliases = ALIASES[old_canonical]
+    for name in old_aliases:
+        if name in ALIAS_LOOKUP and ALIAS_LOOKUP[name] == old_canonical:
+            del ALIAS_LOOKUP[name]
+    
+    # Remove old entry
+    del ALIASES[old_canonical]
+    
+    # Add new entry
+    all_names = set(aliases)
+    all_names.add(canonical)
+    ALIASES[canonical] = sorted(all_names)
+    
+    # Update lookup
+    for name in all_names:
+        if name not in ALIAS_LOOKUP:
+            ALIAS_LOOKUP[name] = canonical
+    
+    save_aliases()
+    return jsonify({'success': True})
+
+
+@app.route('/api/aliases/delete', methods=['POST'])
+def api_aliases_delete():
+    """Delete an alias group."""
+    data = request.get_json()
+    canonical = data.get('canonical', '').strip()
+    
+    if canonical not in ALIASES:
+        return jsonify({'success': False, 'message': '标准名称不存在'})
+    
+    # Remove lookup entries
+    for name in ALIASES[canonical]:
+        if name in ALIAS_LOOKUP and ALIAS_LOOKUP[name] == canonical:
+            del ALIAS_LOOKUP[name]
+    
+    # Remove entry
+    del ALIASES[canonical]
+    
+    save_aliases()
+    return jsonify({'success': True})
+
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=80, debug=False)

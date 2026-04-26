@@ -115,7 +115,7 @@ def parse_files():
                     current_year_num = CN_NUM.get(year_cn, 0)
                     current_section = 'jing' if section_type == '经' else 'zhuan'
                     if current_duke in DUKE_START_BC:
-                        current_year_bc = DUKE_START_BC[current_duke] + current_year_num - 1
+                        current_year_bc = DUKE_START_BC[current_duke] - current_year_num + 1
                     paragraph_id = inner
                     
                 i += 1
