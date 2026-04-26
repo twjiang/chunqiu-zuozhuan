@@ -464,18 +464,47 @@ function renderResults(containerId, data) {
         container.innerHTML = '<div class="empty">未找到相关记录</div>';
         return;
     }
-    let aliasInfo = '';
+    // Build alias info
+    let aliasDiv = null;
     if (data.k && data.k.includes('|')) {
+        aliasDiv = document.createElement('div');
+        aliasDiv.style.cssText = 'color:#8b6914;font-size:0.9rem;margin-bottom:0.5rem;';
+        const label = document.createElement('span');
+        label.textContent = '关联别名：';
+        aliasDiv.appendChild(label);
         const names = data.k.split('|');
-        aliasInfo = '<div style="color:#8b6914;font-size:0.9rem;margin-bottom:0.5rem;">关联别名：' + names.map(n => '<span style="background:#ffeaa7;padding:1px 4px;border-radius:2px;margin:0 2px;">' + n + '</span>').join('') + '</div>';
+        names.forEach(n => {
+            const span = document.createElement('span');
+            span.style.cssText = 'background:#ffeaa7;padding:1px 4px;border-radius:2px;margin:0 2px;cursor:pointer;';
+            span.textContent = n;
+            span.addEventListener('click', () => selectPerson(n));
+            aliasDiv.appendChild(span);
+        });
     }
-    const pages = Math.ceil(data.n / data.ps);
-    let pager = '';
-    if (pages > 1) {
-        pager = '<div style="margin-top:1rem;text-align:center;" class="pager-container" data-ps="' + data.ps + '"></div>';
-    }
-    let html = aliasInfo + '<div class="count">共找到 ' + data.n + ' 条记录' + (data.m ? '（显示第 ' + ((data.p-1)*data.ps+1) + '-' + (data.p*data.ps) + ' 条）' : '') + '</div>';
+    // Count div
+    const countDiv = document.createElement('div');
+    countDiv.className = 'count';
+    countDiv.textContent = '共找到 ' + data.n + ' 条记录' + (data.m ? '（显示第 ' + ((data.p-1)*data.ps+1) + '-' + (data.p*data.ps) + ' 条）' : '');
+    
+    // Clear container and append
+    container.innerHTML = '';
+    if (aliasDiv) container.appendChild(aliasDiv);
+    container.appendChild(countDiv);
+    
+    // Add records
     data.r.forEach(r => {
+        const recDiv = document.createElement('div');
+        recDiv.className = 'record';
+        
+        const metaDiv = document.createElement('div');
+        metaDiv.className = 'meta';
+        metaDiv.innerHTML = '<span>' + escapeHtml(r.d) + (r.y > 0 ? r.y + '年' : '') + '</span>'
+            + '<span>前' + r.b + '年</span>'
+            + '<span>' + (r.s === 'jing' ? '经' : '传') + '</span>';
+        recDiv.appendChild(metaDiv);
+        
+        const textDiv = document.createElement('div');
+        textDiv.className = 'text';
         let text = escapeHtml(r.t);
         if (data.k) {
             const kws = data.k.split('|');
@@ -487,24 +516,32 @@ function renderResults(containerId, data) {
                 }
             });
         }
-        const sectionLabel = r.s === 'jing' ? '经' : '传';
-        html += '<div class="record">'
-            + '<div class="meta">'
-            + '<span>' + r.d + (r.y > 0 ? r.y + '年' : '') + '</span>'
-            + '<span>前' + r.b + '年</span>'
-            + '<span>' + sectionLabel + '</span>'
-            + '</div>'
-            + '<div class="text">' + text + '</div>'
-            + '</div>';
+        textDiv.innerHTML = text;
+        recDiv.appendChild(textDiv);
+        container.appendChild(recDiv);
     });
-    html += pager;
-    container.innerHTML = html;
-    // Bind pagination
-    const ps = parseInt(container.querySelector('.pager-container')?.dataset.ps || 50);
-    container.querySelectorAll('.page-btn').forEach(btn => {
-        btn.addEventListener('click', () => loadPage(containerId, parseInt(btn.dataset.page)));
-    });
+    
+    // Pager
+    const pages = Math.ceil(data.n / data.ps);
+    if (pages > 1) {
+        const pager = document.createElement('div');
+        pager.style.cssText = 'margin-top:1rem;text-align:center;';
+        pager.className = 'pager-container';
+        pager.dataset.ps = data.ps;
+        for (let p = 1; p <= Math.min(pages, 10); p++) {
+            const btn = document.createElement('button');
+            btn.className = 'page-btn';
+            btn.dataset.page = p;
+            btn.textContent = p;
+            btn.style.cssText = 'margin:0 2px;padding:0.3rem 0.7rem;background:' + (p === data.p ? '#8b6914' : '#e8dcc8') + ';color:' + (p === data.p ? '#fff' : '#2c2416') + ';border:none;border-radius:3px;cursor:pointer;';
+            btn.addEventListener('click', () => loadPage(containerId, p));
+            pager.appendChild(btn);
+        }
+        if (pages > 10) pager.appendChild(document.createTextNode(' ... ' + pages));
+        container.appendChild(pager);
+    }
 }
+
 function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
@@ -525,21 +562,39 @@ document.getElementById('input-person').addEventListener('input', function() {
             .then(data => {
                 if (!data.suggestions.length) { box.style.display = 'none'; return; }
                 box.style.display = 'block';
-                box.innerHTML = data.suggestions.map(s => {
+                box.innerHTML = '';
+                data.suggestions.forEach(s => {
                     const div = document.createElement('div');
                     div.style.cssText = 'padding:0.3rem 0.5rem;cursor:pointer;border-bottom:1px solid #eee;';
-                    div.innerHTML = '<b>' + escapeHtml(s.canonical) + '</b>'
-                        + (s.aliases.length > 1 ? ' <span style="color:#8b6914;">（' + s.aliases.filter(a=>a!==s.canonical).map(escapeHtml).join('、') + '）</span>' : '');
-                    div.addEventListener('click', () => selectPerson(s.canonical));
-                    return div.outerHTML;
-                }).join('');
+                    const bold = document.createElement('b');
+                    bold.textContent = s.canonical;
+                    div.appendChild(bold);
+                    if (s.aliases.length > 1) {
+                        const span = document.createElement('span');
+                        span.style.color = '#8b6914';
+                        span.textContent = '（' + s.aliases.filter(a => a !== s.canonical).join('、') + '）';
+                        div.appendChild(span);
+                    }
+                    div.dataset.name = s.canonical;
+                    box.appendChild(div);
+                });
             });
     }, 300);
 });
+// Delegate click on alias-suggest
+const aliasBox = document.getElementById('alias-suggest');
+aliasBox.addEventListener('click', e => {
+    const item = e.target.closest('div[data-name]');
+    if (item) {
+        selectPerson(item.dataset.name);
+    }
+});
 function selectPerson(name) {
     document.getElementById('input-person').value = name;
-    document.getElementById('alias-suggest').style.display = 'none';
-    queryByPerson();
+    const box = document.getElementById('alias-suggest');
+    box.style.display = 'none';
+    box.innerHTML = '';
+    queryByPerson(1);
 }
 document.getElementById('input-search').addEventListener('keydown', e => { if (e.key === 'Enter') fulltextSearch(); });
 document.getElementById('alias-search-input').addEventListener('keydown', e => { if (e.key === 'Enter') searchAliasMgmt(); });
