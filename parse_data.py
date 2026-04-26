@@ -159,6 +159,10 @@ def parse_files():
             # Regular text line
             text = re.sub(r'[¶]', '', line).strip()
             text = cc.convert(text)
+            # Clean kanripo markers like <p><b:KR1e0001_tls_006-311a>
+            text = re.sub(r'<[^>]+>', '', text)
+            text = re.sub(r'KR\w+_\w+-\w+', '', text)
+            text = re.sub(r'\s+', ' ', text).strip()
             if text:
                 if current_paragraph:
                     current_paragraph += text
