@@ -26,15 +26,16 @@ for _i, _r in enumerate(RECORDS):
     for _j in range(len(_text) - 1):
         _bg = _text[_j:_j+2]
         if _bg not in BIGRAM_INDEX:
-            BIGRAM_INDEX[_bg] = []
-        BIGRAM_INDEX[_bg].append(_i)
+            BIGRAM_INDEX[_bg] = set()
+        BIGRAM_INDEX[_bg].add(_i)
+
 # Also index single chars for short queries
 CHAR_INDEX = {}
 for _i, _r in enumerate(RECORDS):
     for _c in set(_r['text']):
         if _c not in CHAR_INDEX:
-            CHAR_INDEX[_c] = []
-        CHAR_INDEX[_c].append(_i)
+            CHAR_INDEX[_c] = set()
+        CHAR_INDEX[_c].add(_i)
 
 # Build duke+year index for O(1) year lookups
 YEAR_INDEX = {}
@@ -44,6 +45,15 @@ for _i, _r in enumerate(RECORDS):
         YEAR_INDEX[_key] = []
     YEAR_INDEX[_key].append(_i)
 
+# Initialize OpenCC for traditional/simplified conversion
+try:
+    from opencc import OpenCC
+    cc_s2t = OpenCC('s2t')
+    cc_t2s = OpenCC('t2s')
+except ImportError:
+    cc_s2t = None
+    cc_t2s = None
+
 # Load person aliases
 ALIASES = {}
 ALIAS_LOOKUP = {}  # reverse: any name -> canonical name
@@ -51,14 +61,27 @@ _alias_path = os.path.join(DATA_DIR, 'person_aliases.json')
 if os.path.exists(_alias_path):
     with open(_alias_path, 'r', encoding='utf-8') as f:
         _raw_aliases = json.load(f)
-    for canonical, alias_list in _raw_aliases.items():
+    for canonical, info in _raw_aliases.items():
+        if isinstance(info, list):
+            alias_list = info
+            state = ""
+            desc = ""
+        else:
+            alias_list = info.get('aliases', [])
+            state = info.get('state', '')
+            desc = info.get('desc', '')
+        
         all_names = set(alias_list)
         all_names.add(canonical)
         for n in all_names:
             if n not in ALIAS_LOOKUP:
                 ALIAS_LOOKUP[n] = canonical
-        # Store full group
-        ALIASES[canonical] = sorted(all_names)
+        # Store full info
+        ALIASES[canonical] = {
+            'aliases': sorted(all_names),
+            'state': state,
+            'desc': desc
+        }
 
 
 def save_aliases():
@@ -68,21 +91,42 @@ def save_aliases():
 
 
 def load_aliases():
-    """Reload aliases from JSON file."""
+    """Reload aliases from JSON file (traditional), support both traditional and simplified search."""
     global ALIASES, ALIAS_LOOKUP
     ALIASES = {}
     ALIAS_LOOKUP = {}
     if os.path.exists(_alias_path):
         with open(_alias_path, 'r', encoding='utf-8') as f:
             _raw = json.load(f)
-        for _canonical, _aliases in _raw.items():
-            _all = set(_aliases)
+        for _canonical, info in _raw.items():
+            if isinstance(info, list):
+                _alias_list = info
+                state = ""
+                desc = ""
+            else:
+                _alias_list = info.get('aliases', [])
+                state = info.get('state', '')
+                desc = info.get('desc', '')
+                
+            _all = set(_alias_list)
             _all.add(_canonical)
-            ALIASES[_canonical] = sorted(_all)
+            ALIASES[_canonical] = {
+                'aliases': sorted(_all),
+                'state': state,
+                'desc': desc
+            }
             for _n in _all:
+                # Add traditional to lookup
                 if _n not in ALIAS_LOOKUP:
                     ALIAS_LOOKUP[_n] = _canonical
-
+                # Also add simplified version
+                if cc_t2s:
+                    try:
+                        _simp = cc_t2s.convert(_n)
+                        if _simp != _n and _simp not in ALIAS_LOOKUP:
+                            ALIAS_LOOKUP[_simp] = _canonical
+                    except:
+                        pass
 
 def find_alias_groups(name):
     """Find alias groups for the given name.
@@ -99,23 +143,34 @@ def find_alias_groups(name):
     # 1. Exact match
     canonical = ALIAS_LOOKUP.get(name)
     if canonical and canonical in ALIASES:
-        key = '|'.join(sorted(ALIASES[canonical]))
+        group = ALIASES[canonical]['aliases']
+        key = '|'.join(sorted(group))
         if key not in seen_keys:
             seen_keys.add(key)
-            matched_groups.append(ALIASES[canonical])
+            matched_groups.append(group)
     
     # 2. If no exact match, try prefix match on aliases
     if not matched_groups:
-        for canonical_name, group in ALIASES.items():
+        names_to_try = {name}
+        if cc_s2t and cc_t2s:
+            names_to_try.add(cc_s2t.convert(name))
+            names_to_try.add(cc_t2s.convert(name))
+        
+        for canonical_name, info in ALIASES.items():
+            group = info['aliases']
             for alias in group:
-                if alias.startswith(name) or name.startswith(alias):
-                    key = '|'.join(sorted(group))
-                    if key not in seen_keys:
-                        seen_keys.add(key)
-                        matched_groups.append(group)
-                    break
+                for n in names_to_try:
+                    if alias.startswith(n) or n.startswith(alias):
+                        key = '|'.join(sorted(group))
+                        if key not in seen_keys:
+                            seen_keys.add(key)
+                            matched_groups.append(group)
+                        break
+                else:
+                    continue
+                break
     
-    # If still no match, just search the name itself
+    # If still no match, just search the name itself (_bigram_search handles variants)
     if not matched_groups:
         return [[name]]
     return matched_groups
@@ -127,49 +182,91 @@ def search_by_year(duke_name, year_num):
     return [RECORDS[i] for i in indices]
 
 
-def _bigram_search(query):
-    """Find record indices containing query using bigram index."""
+def _bigram_search_exact(query):
+    """Find record indices containing exact query using bigram index."""
     if len(query) >= 2:
         candidates = None
         for j in range(len(query) - 1):
             bg = query[j:j+2]
-            idx = set(BIGRAM_INDEX.get(bg, []))
+            idx = BIGRAM_INDEX.get(bg, set())
             candidates = idx if candidates is None else (candidates & idx)
             if not candidates:
                 return set()
         return {i for i in candidates if query in RECORDS[i]['text']}
     elif len(query) == 1:
-        return set(CHAR_INDEX.get(query, []))
+        return CHAR_INDEX.get(query, set())
     return set()
+
+
+def _bigram_search(query):
+    """Find record indices containing query (including traditional/simplified variants)."""
+    results = _bigram_search_exact(query)
+    if cc_s2t and cc_t2s:
+        # Get simplified and traditional versions
+        q_simp = cc_t2s.convert(query)
+        q_trad = cc_s2t.convert(query)
+        if q_simp != query:
+            results |= _bigram_search_exact(q_simp)
+        if q_trad != query and q_trad != q_simp:
+            results |= _bigram_search_exact(q_trad)
+    return results
 
 
 def search_by_person(name):
     """Search records containing a person's name (including all aliases)."""
     groups = find_alias_groups(name)
-    all_names = []
+    
+    # Collect raw names from groups
+    raw_names = []
     seen = set()
     for group in groups:
         for n in group:
             if n not in seen:
                 seen.add(n)
-                all_names.append(n)
+                raw_names.append(n)
+    
+    # Expand names with simplified and traditional variants for highlighting
+    expanded_names = set(raw_names)
+    if cc_s2t and cc_t2s:
+        for n in raw_names:
+            expanded_names.add(cc_s2t.convert(n))
+            expanded_names.add(cc_t2s.convert(n))
+            
+    # Need to keep the list format for compatibility, but include all variants
+    all_names = list(expanded_names)
+
     matched = set()
-    for n in all_names:
-        matched |= _bigram_search(n)
+    for n in expanded_names:
+        matched |= _bigram_search_exact(n)
     results = [RECORDS[i] for i in sorted(matched)]
     return results, all_names
 
 
 def search_by_state(state_name):
     """Search records mentioning a state using index."""
-    indices = _bigram_search(state_name)
+    names_to_try = {state_name}
+    if cc_s2t and cc_t2s:
+        names_to_try.add(cc_s2t.convert(state_name))
+        names_to_try.add(cc_t2s.convert(state_name))
+    
+    indices = set()
+    for n in names_to_try:
+        indices |= _bigram_search_exact(n)
+        
     return [RECORDS[i] for i in sorted(indices)]
 
 
 def fulltext_search(query):
-    """Full-text search using bigram index."""
+    """Full-text search using bigram index, returns results and matching keywords for highlighting."""
     indices = _bigram_search(query)
-    return [RECORDS[i] for i in sorted(indices)]
+    
+    # Get all variants for highlighting
+    keywords = {query}
+    if cc_s2t and cc_t2s:
+        keywords.add(cc_t2s.convert(query))
+        keywords.add(cc_s2t.convert(query))
+        
+    return [RECORDS[i] for i in sorted(indices)], list(keywords)
 
 
 HTML_TEMPLATE = '''<!DOCTYPE html>
@@ -507,13 +604,26 @@ function renderResults(containerId, data) {
         textDiv.className = 'text';
         let text = escapeHtml(r.t);
         if (data.k) {
-            const kws = data.k.split('|');
-            kws.forEach(kw => {
-                const escaped = escapeHtml(kw);
-                if (escaped) {
-                    const re = new RegExp(escaped, 'g');
-                    text = text.replace(re, '<mark>' + escaped + '</mark>');
+            // Sort keywords by length descending to match longest phrases first
+            const kws = data.k.split('|').filter(k => k.trim().length > 0)
+                            .sort((a, b) => b.length - a.length);
+            
+            // Use a unique placeholder system to avoid double-highlighting
+            const placeholders = [];
+            kws.forEach((kw, idx) => {
+                if (kw) {
+                    const escaped = escapeHtml(kw);
+                    const parts = text.split(escaped);
+                    if (parts.length > 1) {
+                        const marker = `___MARKER_${idx}___`;
+                        placeholders.push({ marker, content: '<mark>' + escaped + '</mark>' });
+                        text = parts.join(marker);
+                    }
                 }
+            });
+            // Finalize by replacing markers with actual mark tags
+            placeholders.forEach(p => {
+                text = text.split(p.marker).join(p.content);
             });
         }
         textDiv.innerHTML = text;
@@ -616,9 +726,13 @@ function renderAliasMgmt(aliases) {
     let html = '<div class="count">共 ' + aliases.length + ' 条别名</div>';
     aliases.forEach(item => {
         const tags = item.aliases.map(a => '<span class="tag">' + escapeHtml(a) + '</span>').join('');
-        html += '<div class="record"><div class="meta"><span style="font-weight:bold;color:#8b6914;">' + escapeHtml(item.canonical) + '</span></div>'
+        const stateHtml = item.state ? '<span style="background:#8b6914;color:#fff;padding:2px 6px;border-radius:3px;font-size:0.8rem;margin-left:10px;">' + escapeHtml(item.state) + '</span>' : '';
+        const descHtml = item.desc ? '<div style="font-size:0.9rem;color:#555;margin:0.5rem 0;">' + escapeHtml(item.desc) + '</div>' : '';
+        
+        html += '<div class="record"><div class="meta"><span style="font-weight:bold;color:#8b6914;font-size:1.1rem;">' + escapeHtml(item.canonical) + '</span>' + stateHtml + '</div>'
             + '<div class="tag-cloud">' + tags + '</div>'
-            + '<div style="margin-top:0.3rem;"><button class="alias-mgmt-edit" data-canonical="' + escapeHtml(item.canonical) + '" style="font-size:0.85rem;padding:0.2rem 0.6rem;margin-right:0.3rem;cursor:pointer;background:#e8dcc8;border:none;border-radius:3px;">编辑</button>'
+            + descHtml
+            + '<div style="margin-top:0.5rem;"><button class="alias-mgmt-edit" data-canonical="' + escapeHtml(item.canonical) + '" style="font-size:0.85rem;padding:0.2rem 0.6rem;margin-right:0.3rem;cursor:pointer;background:#e8dcc8;border:none;border-radius:3px;">编辑</button>'
             + '<button class="alias-mgmt-del" data-canonical="' + escapeHtml(item.canonical) + '" style="font-size:0.85rem;padding:0.2rem 0.6rem;cursor:pointer;background:#fadbd8;color:#c0392b;border:none;border-radius:3px;">删除</button></div></div>';
     });
     c.innerHTML = html;
@@ -633,20 +747,26 @@ function searchAliasMgmt() {
 
 function showAddAliasModal() {
     aliasMgmtCurrentEdit = null;
-    document.getElementById('alias-modal-title').textContent = '添加别名';
+    document.getElementById('alias-modal-title').textContent = '添加人物信息';
     document.getElementById('alias-modal-canonical').value = '';
     document.getElementById('alias-modal-aliases').value = '';
+    document.getElementById('alias-modal-state').value = '';
+    document.getElementById('alias-modal-desc').value = '';
     document.getElementById('alias-modal').style.display = 'flex';
 }
 
 function editAliasMgmt(canonical) {
     aliasMgmtCurrentEdit = canonical;
-    document.getElementById('alias-modal-title').textContent = '编辑别名';
+    document.getElementById('alias-modal-title').textContent = '编辑人物信息';
     document.getElementById('alias-modal-canonical').value = canonical;
     fetch('/api/aliases/list?q=' + encodeURIComponent(canonical))
         .then(r => r.json()).then(data => {
             const item = data.aliases.find(a => a.canonical === canonical);
-            if (item) document.getElementById('alias-modal-aliases').value = item.aliases.filter(a => a !== canonical).join(', ');
+            if (item) {
+                document.getElementById('alias-modal-aliases').value = item.aliases.filter(a => a !== canonical).join(', ');
+                document.getElementById('alias-modal-state').value = item.state || '';
+                document.getElementById('alias-modal-desc').value = item.desc || '';
+            }
         });
     document.getElementById('alias-modal').style.display = 'flex';
 }
@@ -658,10 +778,13 @@ function closeAliasModal() {
 function saveAliasMgmt() {
     const canonical = document.getElementById('alias-modal-canonical').value.trim();
     const aliasesStr = document.getElementById('alias-modal-aliases').value.trim();
+    const state = document.getElementById('alias-modal-state').value.trim();
+    const desc = document.getElementById('alias-modal-desc').value.trim();
+    
     if (!canonical) { alert('请输入标准名称'); return; }
     const aliases = aliasesStr.split(/[,，\s]+/).filter(a => a.trim());
     const url = aliasMgmtCurrentEdit ? '/api/aliases/update' : '/api/aliases/add';
-    const body = { canonical, aliases };
+    const body = { canonical, aliases, state, desc };
     if (aliasMgmtCurrentEdit) body.old_canonical = aliasMgmtCurrentEdit;
     fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
         .then(r => r.json()).then(data => {
@@ -696,6 +819,10 @@ document.querySelectorAll('.tab').forEach(tab => {
     <input id="alias-modal-canonical" type="text" placeholder="如：季孙宿" style="width:100%;padding:0.5rem;border:1px solid #c4b08a;border-radius:4px;font-size:1rem;margin-bottom:1rem;">
     <label style="display:block;font-weight:bold;margin-bottom:0.3rem;">别名列表（逗号分隔）</label>
     <input id="alias-modal-aliases" type="text" placeholder="如：季武子, 季武子宿" style="width:100%;padding:0.5rem;border:1px solid #c4b08a;border-radius:4px;font-size:1rem;margin-bottom:1rem;">
+    <label style="display:block;font-weight:bold;margin-bottom:0.3rem;">人物国籍</label>
+    <input id="alias-modal-state" type="text" placeholder="如：鲁国" style="width:100%;padding:0.5rem;border:1px solid #c4b08a;border-radius:4px;font-size:1rem;margin-bottom:1rem;">
+    <label style="display:block;font-weight:bold;margin-bottom:0.3rem;">人物简介</label>
+    <textarea id="alias-modal-desc" placeholder="人物生平简介..." rows="3" style="width:100%;padding:0.5rem;border:1px solid #c4b08a;border-radius:4px;font-size:1rem;margin-bottom:1rem;resize:vertical;"></textarea>
     <div style="display:flex;gap:0.5rem;justify-content:flex-end;">
       <button onclick="closeAliasModal()" style="padding:0.5rem 1rem;background:#e8dcc8;border:none;border-radius:4px;cursor:pointer;">取消</button>
       <button onclick="saveAliasMgmt()" style="padding:0.5rem 1rem;background:#8b6914;color:#fff;border:none;border-radius:4px;cursor:pointer;">保存</button>
@@ -747,11 +874,17 @@ def api_query():
     elif qtype == 'state':
         name = request.args.get('name', '')
         results = search_by_state(name)
-        keyword = name
+        
+        keywords = {name}
+        if cc_s2t and cc_t2s:
+            keywords.add(cc_t2s.convert(name))
+            keywords.add(cc_s2t.convert(name))
+        keyword = '|'.join(keywords)
+        
     elif qtype == 'search':
         q = request.args.get('q', '')
-        results = fulltext_search(q)
-        keyword = q
+        results, kw_list = fulltext_search(q)
+        keyword = '|'.join(kw_list)
 
     total = len(results)
     start = (page - 1) * page_size
@@ -788,7 +921,7 @@ def api_aliases():
     seen = set()
     for name, canonical in ALIAS_LOOKUP.items():
         if q in name:
-            group = ALIASES.get(canonical, [canonical])
+            group = ALIASES.get(canonical, {'aliases': [canonical]})['aliases']
             key = '|'.join(sorted(group))
             if key not in seen:
                 seen.add(key)
@@ -812,14 +945,22 @@ def api_aliases_list():
     """Get all aliases, optionally filtered by search query."""
     q = request.args.get('q', '').strip().lower()
     result = []
-    for canonical, aliases in ALIASES.items():
+    for canonical, info in ALIASES.items():
+        aliases = info['aliases']
         if q:
-            # Search in canonical name or any alias
-            if q not in canonical.lower() and not any(q in a.lower() for a in aliases):
+            # Search in canonical name, aliases, state or desc
+            state = info.get('state', '')
+            desc = info.get('desc', '')
+            if (q not in canonical.lower() and 
+                not any(q in a.lower() for a in aliases) and
+                q not in state.lower() and 
+                q not in desc.lower()):
                 continue
         result.append({
             'canonical': canonical,
-            'aliases': aliases
+            'aliases': aliases,
+            'state': info.get('state', ''),
+            'desc': info.get('desc', '')
         })
     # Sort by canonical name
     result.sort(key=lambda x: x['canonical'])
@@ -832,6 +973,8 @@ def api_aliases_add():
     data = request.get_json()
     canonical = data.get('canonical', '').strip()
     aliases = data.get('aliases', [])
+    state = data.get('state', '').strip()
+    desc = data.get('desc', '').strip()
     
     if not canonical:
         return jsonify({'success': False, 'message': '标准名称不能为空'})
@@ -842,7 +985,11 @@ def api_aliases_add():
     # Add canonical to aliases list
     all_names = set(aliases)
     all_names.add(canonical)
-    ALIASES[canonical] = sorted(all_names)
+    ALIASES[canonical] = {
+        'aliases': sorted(all_names),
+        'state': state,
+        'desc': desc
+    }
     
     # Update lookup
     for name in all_names:
@@ -860,6 +1007,8 @@ def api_aliases_update():
     old_canonical = data.get('old_canonical', '').strip()
     canonical = data.get('canonical', '').strip()
     aliases = data.get('aliases', [])
+    state = data.get('state', '').strip()
+    desc = data.get('desc', '').strip()
     
     if not canonical:
         return jsonify({'success': False, 'message': '标准名称不能为空'})
@@ -868,7 +1017,7 @@ def api_aliases_update():
         return jsonify({'success': False, 'message': '原标准名称不存在'})
     
     # Remove old lookup entries
-    old_aliases = ALIASES[old_canonical]
+    old_aliases = ALIASES[old_canonical]['aliases']
     for name in old_aliases:
         if name in ALIAS_LOOKUP and ALIAS_LOOKUP[name] == old_canonical:
             del ALIAS_LOOKUP[name]
@@ -879,7 +1028,11 @@ def api_aliases_update():
     # Add new entry
     all_names = set(aliases)
     all_names.add(canonical)
-    ALIASES[canonical] = sorted(all_names)
+    ALIASES[canonical] = {
+        'aliases': sorted(all_names),
+        'state': state,
+        'desc': desc
+    }
     
     # Update lookup
     for name in all_names:
@@ -900,7 +1053,7 @@ def api_aliases_delete():
         return jsonify({'success': False, 'message': '标准名称不存在'})
     
     # Remove lookup entries
-    for name in ALIASES[canonical]:
+    for name in ALIASES[canonical]['aliases']:
         if name in ALIAS_LOOKUP and ALIAS_LOOKUP[name] == canonical:
             del ALIAS_LOOKUP[name]
     

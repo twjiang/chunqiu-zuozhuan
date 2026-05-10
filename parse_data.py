@@ -6,7 +6,8 @@ import re
 import json
 from opencc import OpenCC
 
-cc = OpenCC('t2s')
+cc_t2s = OpenCC('t2s')
+cc_s2t = OpenCC('s2t')
 
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT = os.path.join(DATA_DIR, 'zuozhuan_data.json')
@@ -82,7 +83,7 @@ def parse_files():
             # Detect duke heading: ** N 隱公
             duke_match = re.match(r'^\*\*\s+\d+\s+(.+)$', line)
             if duke_match:
-                duke_name = cc.convert(duke_match.group(1).strip())
+                duke_name = cc_t2s.convert(duke_match.group(1).strip())
                 if duke_name in DUKES:
                     current_duke = duke_name
                     current_year_num = 0
@@ -95,7 +96,7 @@ def parse_files():
             year_match = re.match(r'^([AB])\d+\.\d+\u300a(.+?)\u300b$', line)
             if year_match:
                 ab = year_match.group(1)
-                inner = cc.convert(year_match.group(2))
+                inner = cc_t2s.convert(year_match.group(2))
                 # Parse: 隐公元年经
                 ym = re.match(r'^(.+?)(元|一|二|三|四|五|六|七|八|九|十|十一|十二|十三|十四|十五|十六|十七|十八|十九|二十|二十一|二十二|二十三|二十四|二十五|二十六|二十七|二十八|二十九|三十|三十一|三十二|三十三|三十四|三十五|三十六|三十七|三十八|三十九|四十)年([经传])$', inner)
                 if ym:
@@ -137,14 +138,14 @@ def parse_files():
                 current_section = 'jing' if sub_match.group(1) == 'A' else 'zhuan'
                 
                 text = re.sub(r'[¶]', '', rest).strip()
-                text = cc.convert(text)
+                # 保留繁体原文，去掉 `text = cc.convert(text)`
                 if text and not text.startswith('\u300a'):
                     current_paragraph = text
                 i += 1
                 continue
             
             # Also detect standalone B《傳》 marker (prologue before year 1)
-            if re.match(r'^B\u300a?傳\u300b?$', line) or re.match(r'^B《传》$', cc.convert(line)):
+            if re.match(r'^B\u300a?傳\u300b?$', line) or re.match(r'^B《传》$', cc_t2s.convert(line)):
                 if current_paragraph.strip():
                     records.append(make_record(
                         current_duke, current_year_num, current_year_bc,
@@ -158,7 +159,6 @@ def parse_files():
             
             # Regular text line
             text = re.sub(r'[¶]', '', line).strip()
-            text = cc.convert(text)
             # Clean kanripo markers like <p><b:KR1e0001_tls_006-311a>
             text = re.sub(r'<[^>]+>', '', text)
             text = re.sub(r'KR\w+_\w+-\w+', '', text)
@@ -227,7 +227,14 @@ def main():
     # Build state index
     state_index = {}
     for state in STATES:
-        state_recs = [r for r in records if state in r['text']]
+        # Convert state name to traditional since the text is kept in traditional
+        state_trad = cc_s2t.convert(state)
+        
+        state_recs = []
+        for r in records:
+            if state in r['text'] or state_trad in r['text']:
+                state_recs.append(r)
+        
         if state_recs:
             state_index[state] = len(state_recs)
     
